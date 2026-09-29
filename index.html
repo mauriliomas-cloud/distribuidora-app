@@ -659,6 +659,22 @@ function saveConfig(cfg) {
   _fbConfig = cfg;
 }
 
+// Busca config do Firestore via REST (funciona em qualquer dispositivo sem localStorage)
+async function fetchConfigFromFirestore(projectId) {
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/config/appConfig`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const fields = data.fields || {};
+    const cfg = {};
+    for (const [k, v] of Object.entries(fields)) {
+      cfg[k] = v.stringValue ?? v.booleanValue ?? v.integerValue ?? null;
+    }
+    return cfg.apiKey ? cfg : null;
+  } catch (e) { return null; }
+}
+
 async function initFirebase(cfg) {
   try {
     if (firebase.apps.length) firebase.apps.forEach(app => app.delete());
@@ -790,6 +806,8 @@ async function finalizarSetup() {
   const adminUser = { id: gid(), nome, perfil: 'admin', senha, cor: '#e85d5d', criadoEm: new Date().toISOString() };
   await fbSave('usuarios', adminUser.id, adminUser);
   await fbSave('config', 'empresa', { nome: nomeEmpresa, nomeFantasia: nomeEmpresa, setupConcluido: true, criadoEm: new Date().toISOString() });
+  // Salva o firebaseConfig no Firestore para que outros dispositivos possam carregar sem refazer o setup
+  await fbSave('config', 'appConfig', { ..._testCfg, _setupVersion: 1 });
   localStorage.setItem('dc6_setup_ok', '1');
   document.getElementById('setup-screen').style.display = 'none';
   await carregarApp();
@@ -1633,16 +1651,40 @@ function exportarTudoCSV() { exportarEstoqueCSV(); setTimeout(exportarVendasCSV,
 // INIT — decide qual tela mostrar
 // ══════════════════════════════════════════════════════
 async function init() {
-  const cfg = loadConfig();
+  let cfg = loadConfig();
   const setupOk = localStorage.getItem('dc6_setup_ok');
-  if (cfg && setupOk) {
-    // Setup já feito — inicializa Firebase e vai para login
+
+  // Dispositivo novo: tenta buscar config do Firestore usando projectId conhecido
+  if (!cfg || !setupOk) {
+    // Lista de projectIds para tentar (o app pode ter sido configurado antes)
+    const knownProjects = ['distribuidora-qbeleza'];
+    for (const pid of knownProjects) {
+      const remoteCfg = await fetchConfigFromFirestore(pid);
+      if (remoteCfg) {
+        cfg = remoteCfg;
+        saveConfig(cfg);
+        localStorage.setItem('dc6_setup_ok', '1');
+        break;
+      }
+    }
+  }
+
+  if (cfg) {
     const ok = await initFirebase(cfg);
     if (ok) {
+      // Verifica se o setup foi concluído no Firestore
+      try {
+        const snap = await db.collection('config').doc('empresa').get();
+        if (snap.exists && snap.data().setupConcluido) {
+          document.getElementById('setup-screen').style.display = 'none';
+          await carregarApp();
+          return;
+        }
+      } catch(e) {}
+      // Firebase conectou mas setup não concluído
       document.getElementById('setup-screen').style.display = 'none';
       await carregarApp();
     } else {
-      // Erro de conexão — mostra setup novamente para reconfigurar
       document.getElementById('setup-screen').style.display = 'flex';
     }
   } else {
